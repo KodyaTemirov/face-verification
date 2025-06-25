@@ -1,0 +1,1 @@
+# Пакет тестов для Face Verification Service 
