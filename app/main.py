@@ -39,7 +39,15 @@ except ImportError:
         NOTIFY_ON_SPOOFING = True
         NOTIFY_ON_LOW_CONFIDENCE = True
         NOTIFY_ON_ERRORS = True
-        ANTISPOOF_THRESHOLD = 0.5
+        
+        # Улучшенные настройки антиспуфинга
+        ANTISPOOF_THRESHOLD = 0.3  # Более мягкий основной порог
+        ANTISPOOF_STRICT_THRESHOLD = 0.7  # Строгий порог для явных подделок
+        ANTISPOOF_MIN_CONFIDENCE = 0.4  # Минимальная уверенность для блокировки
+        
+        # Контекстные пороги
+        LOW_QUALITY_IMAGE_THRESHOLD = 0.2  # Порог для изображений низкого качества
+        HIGH_QUALITY_IMAGE_THRESHOLD = 0.5  # Порог для изображений высокого качества
         
         @classmethod
         def is_telegram_configured(cls):
@@ -96,9 +104,17 @@ except ImportError:
                     img2_spoof = antispoof_results.get('image2', {})
                     
                     # Проверяем только второе изображение на спуфинг
-                    if not img2_spoof.get('is_real', True) and img2_spoof.get('confidence', 0) > 0:
+                    # Блокируем только если уверенность в подделке достаточно высока
+                    if not img2_spoof.get('is_real', True):
                         confidence = img2_spoof.get('confidence', 0) * 100
-                        reasons.append(f"🚫 Изображение 2: подделка (уверенность: {confidence:.1f}%)")
+                        model_used = img2_spoof.get('model_used', 'unknown')
+                        
+                        # Добавляем причину только если уверенность превышает минимальный порог
+                        if img2_spoof.get('confidence', 0) >= config.ANTISPOOF_MIN_CONFIDENCE:
+                            reasons.append(f"🚫 Изображение 2: подделка (уверенность: {confidence:.1f}%, модель: {model_used})")
+                        else:
+                            # Низкая уверенность - добавляем предупреждение, но не блокируем
+                            logger.info(f"Низкая уверенность в подделке ({confidence:.1f}%), изображение пропущено")
                 
                 if reasons:
                     message += f"\n\n🔴 ПРИЧИНЫ ОТКЛОНЕНИЯ:\n" + "\n".join(reasons)
@@ -252,13 +268,68 @@ class AntiSpoofProcessor:
             logger.error(f"Ошибка предобработки для антиспуфинга: {e}")
             return None
     
+    def _assess_image_quality(self, face_image):
+        """Оценка качества изображения для адаптации порогов"""
+        try:
+            gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+            
+            # 1. Резкость (Laplacian variance)
+            sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+            sharpness_norm = min(sharpness / 1000.0, 1.0)  # Нормализация
+            
+            # 2. Контраст (стандартное отклонение)
+            contrast = np.std(gray) / 255.0
+            
+            # 3. Яркость (среднее значение)
+            brightness = np.mean(gray) / 255.0
+            brightness_score = 1.0 - abs(brightness - 0.5) * 2  # Лучше всего средняя яркость
+            
+            # 4. Равномерность освещения
+            lighting_uniformity = 1.0 - (np.std(gray) / np.mean(gray)) if np.mean(gray) > 0 else 0
+            lighting_uniformity = max(0, min(1, lighting_uniformity))
+            
+            # 5. Размер лица (больше = лучше)
+            face_size = face_image.shape[0] * face_image.shape[1]
+            size_score = min(face_size / (200 * 200), 1.0)  # Нормализация относительно 200x200
+            
+            # Комбинированная оценка качества
+            quality_score = (
+                sharpness_norm * 0.25 +
+                contrast * 0.25 +
+                brightness_score * 0.2 +
+                lighting_uniformity * 0.15 +
+                size_score * 0.15
+            )
+            
+            return {
+                "overall_quality": quality_score,
+                "sharpness": sharpness_norm,
+                "contrast": contrast,
+                "brightness": brightness_score,
+                "lighting": lighting_uniformity,
+                "size_score": size_score,
+                "is_high_quality": quality_score > 0.6,
+                "is_low_quality": quality_score < 0.3
+            }
+            
+        except Exception as e:
+            logger.warning(f"Ошибка оценки качества изображения: {e}")
+            return {
+                "overall_quality": 0.5,
+                "is_high_quality": False,
+                "is_low_quality": False
+            }
+
     def predict(self, face_image):
-        """Предсказание: реальное лицо или подделка"""
+        """Улучшенное предсказание: реальное лицо или подделка с адаптивными порогами"""
         if self.session is None:
-            # Заглушка: используем простую эвристику
-            return self._fallback_prediction(face_image)
+            # Заглушка: используем улучшенную эвристику
+            return self._enhanced_fallback_prediction(face_image)
         
         try:
+            # Оценка качества изображения для адаптации порогов
+            quality_assessment = self._assess_image_quality(face_image)
+            
             # Предобработка
             preprocessed = self.preprocess_face(face_image)
             if preprocessed is None:
@@ -274,40 +345,110 @@ class AntiSpoofProcessor:
                     # Бинарная классификация: [fake_prob, real_prob]
                     fake_prob = float(outputs[0][0])
                     real_prob = float(outputs[0][1])
-                    is_real = real_prob > fake_prob
-                    confidence = max(fake_prob, real_prob)
-                    score = real_prob
+                    raw_score = real_prob
+                    model_confidence = max(fake_prob, real_prob)
                 else:
                     # Одно значение (вероятность реального лица)
-                    score = float(outputs[0][0]) if len(outputs[0]) > 0 else 0.5
-                    is_real = score > config.ANTISPOOF_THRESHOLD
-                    confidence = abs(score - 0.5) * 2
+                    raw_score = float(outputs[0][0]) if len(outputs[0]) > 0 else 0.5
+                    model_confidence = abs(raw_score - 0.5) * 2
                 
-                # Проверяем и отправляем уведомления
-                if not is_real and config.NOTIFY_ON_SPOOFING:
-                    telegram_notifier.notify_spoofing_detected("Обнаружена подделка", confidence)
+                # Адаптивное принятие решения на основе качества изображения
+                adapted_result = self._adaptive_decision(raw_score, model_confidence, quality_assessment)
+                
+                # Уведомления только для явных подделок с высокой уверенностью
+                if not adapted_result["is_real"] and adapted_result["confidence"] > config.ANTISPOOF_STRICT_THRESHOLD and config.NOTIFY_ON_SPOOFING:
+                    telegram_notifier.notify_spoofing_detected("Обнаружена явная подделка", adapted_result["confidence"])
                 
                 return {
-                    "is_real": is_real,
-                    "confidence": float(confidence),
-                    "score": float(score),
+                    **adapted_result,
                     "error": None,
-                    "model_used": "neural_network"
+                    "model_used": "neural_network_adaptive",
+                    "quality_assessment": quality_assessment,
+                    "raw_model_score": float(raw_score),
+                    "model_confidence": float(model_confidence)
                 }
                 
             except Exception as model_error:
                 logger.warning(f"Ошибка работы модели антиспуфинга: {model_error}")
-                return self._fallback_prediction(face_image)
+                return self._enhanced_fallback_prediction(face_image)
                 
         except Exception as e:
             logger.error(f"Общая ошибка антиспуфинг предсказания: {e}")
             telegram_notifier.notify_error("Антиспуфинг ошибка", str(e))
             return {"is_real": True, "confidence": 0.0, "error": str(e)}
-    
-    def _fallback_prediction(self, face_image):
-        """Резервный алгоритм антиспуфинга на основе эвристик"""
+
+    def _adaptive_decision(self, raw_score, model_confidence, quality_assessment):
+        """Адаптивное принятие решения на основе качества изображения"""
         try:
-            # Простые эвристики для определения подделки
+            quality_score = quality_assessment.get("overall_quality", 0.5)
+            is_high_quality = quality_assessment.get("is_high_quality", False)
+            is_low_quality = quality_assessment.get("is_low_quality", False)
+            
+            # Выбираем порог в зависимости от качества изображения
+            if is_low_quality:
+                # Для изображений низкого качества - очень мягкий порог
+                threshold = config.LOW_QUALITY_IMAGE_THRESHOLD
+                logger.info(f"Изображение низкого качества, используем мягкий порог: {threshold}")
+            elif is_high_quality:
+                # Для изображений высокого качества - стандартный порог
+                threshold = config.HIGH_QUALITY_IMAGE_THRESHOLD
+                logger.info(f"Изображение высокого качества, используем стандартный порог: {threshold}")
+            else:
+                # Адаптивный порог на основе качества
+                threshold = config.ANTISPOOF_THRESHOLD * (1 + quality_score * 0.5)
+                logger.info(f"Адаптивный порог на основе качества ({quality_score:.2f}): {threshold:.3f}")
+            
+            # Базовое решение
+            is_real_base = raw_score > threshold
+            
+            # Дополнительные проверки для снижения ложных срабатываний
+            confidence_penalty = 0.0
+            
+            # Штраф за низкое качество изображения
+            if is_low_quality:
+                confidence_penalty += 0.2
+                logger.info("Применен штраф за низкое качество изображения")
+            
+            # Бонус за высокое качество
+            quality_bonus = quality_score * 0.1
+            
+            # Финальная уверенность с учетом корректировок
+            final_confidence = max(0.0, min(1.0, model_confidence - confidence_penalty + quality_bonus))
+            
+            # Финальное решение: блокируем только если уверенность выше минимального порога
+            is_real_final = is_real_base or (final_confidence < config.ANTISPOOF_MIN_CONFIDENCE)
+            
+            # Логирование решения
+            logger.info(f"Антиспуфинг решение: raw_score={raw_score:.3f}, threshold={threshold:.3f}, "
+                       f"model_confidence={model_confidence:.3f}, final_confidence={final_confidence:.3f}, "
+                       f"is_real={is_real_final}")
+            
+            return {
+                "is_real": is_real_final,
+                "confidence": float(final_confidence),
+                "score": float(raw_score),
+                "decision_threshold": float(threshold),
+                "quality_bonus": float(quality_bonus),
+                "confidence_penalty": float(confidence_penalty)
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка адаптивного решения: {e}")
+            # В случае ошибки - консервативное решение (считаем реальным)
+            return {
+                "is_real": True,
+                "confidence": 0.5,
+                "score": float(raw_score),
+                "error": str(e)
+            }
+    
+    def _enhanced_fallback_prediction(self, face_image):
+        """Улучшенный резервный алгоритм антиспуфинга с адаптивными порогами"""
+        try:
+            # Получаем оценку качества изображения
+            quality_assessment = self._assess_image_quality(face_image)
+            
+            # Конвертируем в оттенки серого
             gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
             
             # 1. Анализ текстуры (расчет стандартного отклонения)
@@ -320,28 +461,65 @@ class AntiSpoofProcessor:
             # 3. Анализ яркости (равномерность освещения)
             brightness_var = np.var(gray) / (255.0 ** 2)
             
-            # Комбинированный скор
-            combined_score = (texture_score * 0.4 + edge_density * 0.4 + brightness_var * 0.2)
+            # 4. Анализ LBP (Local Binary Patterns) для текстуры
+            lbp_score = self._calculate_lbp_score(gray)
             
-            # Нормализация и принятие решения
-            is_real = combined_score > 0.3  # Эмпирический порог
-            confidence = min(combined_score * 2, 1.0)
+            # 5. Анализ частотных характеристик (FFT)
+            frequency_score = self._calculate_frequency_score(gray)
+            
+            # Комбинированный скор с учетом новых метрик
+            combined_score = (
+                texture_score * 0.25 +
+                edge_density * 0.25 +
+                brightness_var * 0.15 +
+                lbp_score * 0.2 +
+                frequency_score * 0.15
+            )
+            
+            # Адаптивный порог на основе качества изображения
+            if quality_assessment.get("is_low_quality", False):
+                threshold = 0.15  # Очень мягкий для низкого качества
+                logger.info("Fallback: используем мягкий порог для низкого качества")
+            elif quality_assessment.get("is_high_quality", False):
+                threshold = 0.4   # Стандартный для высокого качества
+                logger.info("Fallback: используем стандартный порог для высокого качества")
+            else:
+                threshold = 0.25  # Средний порог
+                logger.info("Fallback: используем средний порог")
+            
+            # Принятие решения с учетом качества
+            is_real = combined_score > threshold
+            
+            # Корректировка уверенности на основе качества
+            base_confidence = min(combined_score * 2, 1.0)
+            quality_bonus = quality_assessment.get("overall_quality", 0.5) * 0.1
+            
+            # Финальная уверенность (консервативная для fallback)
+            final_confidence = max(0.1, min(0.7, base_confidence + quality_bonus))
+            
+            # Логирование fallback решения
+            logger.info(f"Fallback антиспуфинг: combined_score={combined_score:.3f}, "
+                       f"threshold={threshold:.3f}, is_real={is_real}, confidence={final_confidence:.3f}")
             
             return {
                 "is_real": is_real,
-                "confidence": float(confidence),
+                "confidence": float(final_confidence),
                 "score": float(combined_score),
                 "error": None,
-                "model_used": "heuristic_fallback",
+                "model_used": "enhanced_heuristic_fallback",
+                "quality_assessment": quality_assessment,
+                "decision_threshold": float(threshold),
                 "details": {
                     "texture_score": float(texture_score),
                     "edge_density": float(edge_density),
-                    "brightness_var": float(brightness_var)
+                    "brightness_var": float(brightness_var),
+                    "lbp_score": float(lbp_score),
+                    "frequency_score": float(frequency_score)
                 }
             }
             
         except Exception as e:
-            logger.error(f"Ошибка резервного алгоритма: {e}")
+            logger.error(f"Ошибка улучшенного резервного алгоритма: {e}")
             return {
                 "is_real": True,
                 "confidence": 0.5,
@@ -349,6 +527,83 @@ class AntiSpoofProcessor:
                 "error": str(e),
                 "model_used": "default_safe"
             }
+
+    def _calculate_lbp_score(self, gray_image):
+        """Вычисление оценки на основе Local Binary Patterns"""
+        try:
+            # Упрощенная версия LBP
+            height, width = gray_image.shape
+            lbp_values = []
+            
+            # Проходим по изображению с шагом (упрощенная версия)
+            for y in range(1, height - 1, 4):
+                for x in range(1, width - 1, 4):
+                    center = gray_image[y, x]
+                    binary_pattern = 0
+                    
+                    # 8-соседний LBP
+                    neighbors = [
+                        gray_image[y-1, x-1], gray_image[y-1, x], gray_image[y-1, x+1],
+                        gray_image[y, x+1], gray_image[y+1, x+1], gray_image[y+1, x],
+                        gray_image[y+1, x-1], gray_image[y, x-1]
+                    ]
+                    
+                    for i, neighbor in enumerate(neighbors):
+                        if neighbor >= center:
+                            binary_pattern |= (1 << i)
+                    
+                    lbp_values.append(binary_pattern)
+            
+            if len(lbp_values) == 0:
+                return 0.5
+            
+            # Вычисляем разнообразие паттернов
+            unique_patterns = len(set(lbp_values))
+            pattern_diversity = min(unique_patterns / 100.0, 1.0)  # Нормализация
+            
+            return pattern_diversity
+            
+        except Exception as e:
+            logger.warning(f"Ошибка вычисления LBP: {e}")
+            return 0.5
+
+    def _calculate_frequency_score(self, gray_image):
+        """Анализ частотных характеристик через FFT"""
+        try:
+            # Применяем FFT
+            fft = np.fft.fft2(gray_image)
+            fft_shift = np.fft.fftshift(fft)
+            magnitude_spectrum = np.abs(fft_shift)
+            
+            # Анализируем распределение частот
+            height, width = magnitude_spectrum.shape
+            center_y, center_x = height // 2, width // 2
+            
+            # Высокие частоты (дальше от центра)
+            high_freq_mask = np.zeros_like(magnitude_spectrum)
+            y, x = np.ogrid[:height, :width]
+            distance = np.sqrt((y - center_y)**2 + (x - center_x)**2)
+            high_freq_mask[distance > min(height, width) * 0.3] = 1
+            
+            high_freq_energy = np.sum(magnitude_spectrum * high_freq_mask)
+            total_energy = np.sum(magnitude_spectrum)
+            
+            if total_energy > 0:
+                high_freq_ratio = high_freq_energy / total_energy
+                # Нормализация (реальные изображения обычно имеют больше высоких частот)
+                frequency_score = min(high_freq_ratio * 10, 1.0)
+            else:
+                frequency_score = 0.5
+            
+            return frequency_score
+            
+        except Exception as e:
+            logger.warning(f"Ошибка анализа частот: {e}")
+            return 0.5
+
+    def _fallback_prediction(self, face_image):
+        """Простой резервный алгоритм (для обратной совместимости)"""
+        return self._enhanced_fallback_prediction(face_image)
 
 # Класс для работы с MagFace
 class MagFaceProcessor:
