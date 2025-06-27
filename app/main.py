@@ -864,23 +864,27 @@ async def compare_faces(request: CompareRequest):
             metric=request.metric
         )
         
-        # Отправляем расширенное уведомление с URL изображений
-        try:
-            # Определяем URL изображений
-            img1_url = request.image1 if request.image1_type == "url" else None
-            img2_url = request.image2 if request.image2_type == "url" else None
-            
-            telegram_notifier.notify_comparison_result(
-                similarity=result["similarity"], 
-                verified=result["verified"], 
-                processing_time=result["processing_time"],
-                image1_url=img1_url,
-                image2_url=img2_url,
-                antispoof_results=result.get("antispoof_results"),
-                threshold=result["threshold"]
-            )
-        except Exception as notify_error:
-            logger.warning(f"Ошибка отправки расширенного уведомления: {notify_error}")
+        # Отправляем уведомление только при неуспешной верификации
+        if not result["verified"]:
+            try:
+                # Определяем URL изображений
+                img1_url = request.image1 if request.image1_type == "url" else None
+                img2_url = request.image2 if request.image2_type == "url" else None
+                
+                telegram_notifier.notify_comparison_result(
+                    similarity=result["similarity"], 
+                    verified=result["verified"], 
+                    processing_time=result["processing_time"],
+                    image1_url=img1_url,
+                    image2_url=img2_url,
+                    antispoof_results=result.get("antispoof_results"),
+                    threshold=result["threshold"]
+                )
+                logger.info("📤 Уведомление отправлено - верификация не пройдена")
+            except Exception as notify_error:
+                logger.warning(f"Ошибка отправки уведомления: {notify_error}")
+        else:
+            logger.info("✅ Верификация пройдена - уведомление не отправляется")
         
         return result
         
