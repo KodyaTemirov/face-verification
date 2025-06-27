@@ -1,18 +1,43 @@
 version: '3.8'
+
 services:
-  face-comparison-api:
+  face-comparison:
     build: .
+    container_name: face-comparison-service
+    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
+      - PYTHONUNBUFFERED=1
       - MODEL_CACHE_DIR=/app/models
-      - PYTHONPATH=/app
+      # Telegram настройки
+      - TELEGRAM_BOT_TOKEN=7267358011:AAGMaQNXOcRuizEijEzri0AumB-T5yetmy4
+      - TELEGRAM_CHAT_ID=-4895422691
+      - TELEGRAM_ENABLED=true
+      # Уведомления
+      - NOTIFY_ON_SPOOFING=true
+      - NOTIFY_ON_LOW_CONFIDENCE=true
+      - NOTIFY_ON_ERRORS=true
+      - NOTIFY_ON_HIGH_VOLUME=true
+      # Антиспуфинг
+      - ANTISPOOF_THRESHOLD=0.5
+      - ANTISPOOF_CONFIDENCE_MIN=0.7
     volumes:
       - ./models:/app/models
       - ./logs:/app/logs
-    restart: unless-stopped
+      - ./temp:/app/temp
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 30s
       timeout: 10s
-      retries: 3 
+      retries: 3
+      start_period: 60s
+    networks:
+      - face-comparison-network
+
+networks:
+  face-comparison-network:
+    driver: bridge
+
+volumes:
+  portainer_data: 

@@ -1,0 +1,32 @@
+[Unit]
+Description=Face Comparison Service with GPU Support
+After=network.target docker.service nvidia-container-runtime.service
+Requires=docker.service
+Wants=nvidia-container-runtime.service
+
+[Service]
+Type=exec
+User=ubuntu
+Group=docker
+WorkingDirectory=/opt/face-comparison-service
+ExecStartPre=/bin/bash -c 'nvidia-smi > /dev/null 2>&1 || (echo "GPU not available" && exit 1)'
+ExecStartPre=/usr/bin/docker-compose down
+ExecStart=/usr/bin/docker-compose up --build
+ExecStop=/usr/bin/docker-compose down
+ExecReload=/usr/bin/docker-compose restart
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=face-comparison
+KillMode=mixed
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+# Environment variables
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="COMPOSE_PROJECT_NAME=face_comparison"
+Environment="DOCKER_BUILDKIT=1"
+
+[Install]
+WantedBy=multi-user.target 
