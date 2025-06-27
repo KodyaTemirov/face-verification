@@ -1379,9 +1379,39 @@ async def compare_faces(request: CompareRequest):
         app_stats["failed_comparisons"] += 1
         logger.error(f"Ошибка в endpoint compare_faces: {str(e)}")
         
-        # Отправляем уведомление об ошибке
+        # Отправляем уведомление об ошибке с дополнительной информацией
         try:
-            telegram_notifier.notify_error("API Error", str(e))
+            error_message = str(e)
+            
+            # Специальная обработка для ошибки "Лица не обнаружены"
+            if "Лица не обнаружены на изображении" in error_message:
+                # Определяем URL изображений для отправки в уведомлении
+                img1_url = request.image1 if request.image1_type == "url" else None
+                img2_url = request.image2 if request.image2_type == "url" else None
+                
+                # Формируем детальное сообщение с ссылками на изображения
+                detailed_message = f"🔍 ЛИЦА НЕ ОБНАРУЖЕНЫ\n\n📝 {error_message}"
+                
+                # Добавляем ссылки на изображения если есть
+                if img1_url or img2_url:
+                    detailed_message += f"\n\n🖼️ ИЗОБРАЖЕНИЯ:"
+                    if img1_url:
+                        detailed_message += f"\n📎 Изображение 1:\n{img1_url}"
+                    if img2_url:
+                        detailed_message += f"\n📎 Изображение 2:\n{img2_url}"
+                else:
+                    detailed_message += f"\n\n📎 Изображения переданы в формате base64"
+                
+                detailed_message += f"\n\n⏰ Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                detailed_message += f"\n🔧 Требуется проверка качества изображений"
+                
+                # Отправляем специальное уведомление
+                telegram_notifier.send_message(detailed_message)
+                logger.info("📤 Отправлено уведомление о необнаруженных лицах с ссылками")
+            else:
+                # Обычное уведомление об ошибке
+                telegram_notifier.notify_error("API Error", error_message)
+                
         except Exception as notify_error:
             logger.warning(f"Ошибка отправки уведомления об ошибке: {notify_error}")
         
