@@ -460,7 +460,16 @@ class MagFaceProcessor:
                             valid_faces.append(face)
                     
                     if valid_faces:
-                        logger.info(f"✅ Найдено {len(valid_faces)} валидных лиц на попытке {i}")
+                        # Сортируем лица по размеру (площади) - самое большое первым
+                        valid_faces.sort(key=lambda face: (face.bbox[2] - face.bbox[0]) * (face.bbox[3] - face.bbox[1]), reverse=True)
+                        
+                        # Логируем информацию о найденных лицах
+                        for j, face in enumerate(valid_faces):
+                            bbox = face.bbox
+                            area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                            logger.info(f"Лицо {j+1}: площадь {area:.0f} пикселей, bbox={bbox}")
+                        
+                        logger.info(f"✅ Найдено {len(valid_faces)} валидных лиц на попытке {i}, выбрано самое крупное")
                         return valid_faces
                         
             except Exception as e:
@@ -529,6 +538,11 @@ class MagFaceProcessor:
             
             # Берем самое крупное лицо (первое после сортировки)
             main_face = faces[0]
+            
+            # Логируем информацию о выбранном лице
+            bbox = main_face.bbox
+            face_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            logger.info(f"🎯 Выбрано лицо с наибольшей площадью: {face_area:.0f} пикселей из {len(faces)} найденных")
             
             # Извлекаем область лица для антиспуфинга
             antispoof_result = None
